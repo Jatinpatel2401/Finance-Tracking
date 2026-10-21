@@ -24,15 +24,500 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: 4. Generate Android Project Shell
+      - name: 4. Create Clean App Code Automatically
         run: |
-          cp lib/main.dart /tmp/main.dart
-          cp pubspec.yaml /tmp/pubspec.yaml
-          flutter create . --org com.secure --project-name apple_finance_tracker --platforms=android
-          cp /tmp/main.dart lib/main.dart
-          cp /tmp/pubspec.yaml pubspec.yaml
+          mkdir -p lib
+          cat << 'EOF' > lib/main.dart
+          import 'dart:convert';
+          import 'dart:math';
+          import 'package:flutter/cupertino.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:local_auth/local_auth.dart';
+          import 'package:sqflite_sqlcipher/sqflite.dart';
+          import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+          import 'package:intl/intl.dart';
+          import 'package:path/path.dart' as p;
 
-      - name: 5. Configure Android Manifest & Security Flags
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const AppleFinanceApp());
+          }
+
+          class AppleFinanceApp extends StatelessWidget {
+            const AppleFinanceApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return const CupertinoApp(
+                debugShowCheckedModeBanner: false,
+                title: 'Wallet Tracker',
+                theme: CupertinoThemeData(
+                  brightness: Brightness.light,
+                  primaryColor: Color(0xFF007AFF),
+                  scaffoldBackgroundColor: Color(0xFFF2F2F7),
+                  barBackgroundColor: Color(0xCCF9F9F9),
+                ),
+                home: AuthGateScreen(),
+              );
+            }
+          }
+
+          class AuthGateScreen extends StatefulWidget {
+            const AuthGateScreen({super.key});
+
+            @override
+            State<AuthGateScreen> createState() => _AuthGateScreenState();
+          }
+
+          class _AuthGateScreenState extends State<AuthGateScreen> {
+            final LocalAuthentication _auth = LocalAuthentication();
+            bool _isAuthenticated = false;
+            String _statusMessage = 'Locked for your security';
+
+            @override
+            void initState() {
+              super.initState();
+              _authenticate();
+            }
+
+            Future<void> _authenticate() async {
+              try {
+                bool canCheck = await _auth.canCheckBiometrics || await _auth.isDeviceSupported();
+                if (!canCheck) {
+                  setState(() => _isAuthenticated = true);
+                  return;
+                }
+                bool didAuth = await _auth.authenticate(
+                  localizedReason: 'Unlock your encrypted Finance Tracker',
+                  options: const AuthenticationOptions(biometricOnly: false, stickyAuth: true),
+                );
+                if (didAuth) {
+                  setState(() => _isAuthenticated = true);
+                }
+              } catch (e) {
+                setState(() => _statusMessage = 'Authentication failed. Tap below to retry.');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              if (_isAuthenticated) {
+                return const DashboardScreen();
+              }
+              return CupertinoPageScaffold(
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(24),
+                        decoration: BoxDecoration(
+                          color: CupertinoColors.white,
+                          shape: BoxShape.circle,
+                          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 20, offset: const Offset(0, 8))],
+                        ),
+                        child: const Icon(CupertinoIcons.lock_shield_fill, size: 56, color: Color(0xFF007AFF)),
+                      ),
+                      const SizedBox(height: 24),
+                      const Text('Finance Vault Locked', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700, letterSpacing: -0.5)),
+                      const SizedBox(height: 8),
+                      Text(_statusMessage, style: const TextStyle(fontSize: 15, color: CupertinoColors.systemGrey)),
+                      const SizedBox(height: 32),
+                      CupertinoButton.filled(
+                        borderRadius: BorderRadius.circular(14),
+                        onPressed: _authenticate,
+                        child: const Text('Unlock with Fingerprint / PIN', style: TextStyle(fontWeight: FontWeight.w600)),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+
+          class EncryptedDbHelper {
+            static Database? _db;
+            static const _secureStorage = FlutterSecureStorage();
+
+            static Future<Database> get database async {
+              if (_db != null) return _db!;
+              _db = await _initEncryptedDb();
+              return _db!;
+            }
+
+            static Future<Database> _initEncryptedDb() async {
+              String? encryptionKey = await _secureStorage.read(key: 'db_aes_key');
+              if (encryptionKey == null) {
+                final random = Random.secure();
+                final values = List<int>.generate(32, (i) => random.nextInt(256));
+                encryptionKey = base64UrlEncode(values);
+                await _secureStorage.write(key: 'db_aes_key', value: encryptionKey);
+              }
+
+              final dbPath = await getDatabasesPath();
+              final path = p.join(dbPath, 'secure_finance_vault.db');
+
+              return await openDatabase(
+                path,
+                password: encryptionKey,
+                version: 1,
+                onCreate: (db, version) async {
+                  await db.execute('CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL, merchant TEXT, category TEXT, rawSms TEXT, timestamp INTEGER)');
+                  await db.execute('CREATE TABLE merchant_rules (merchant TEXT PRIMARY KEY, category TEXT)');
+                },
+              );
+            }
+          }
+
+          class DashboardScreen extends StatefulWidget {
+            const DashboardScreen({super.key});
+
+            @override
+            State<DashboardScreen> createState() => _DashboardScreenState();
+          }
+
+          class _DashboardScreenState extends State<DashboardScreen> {
+            static const platform = MethodChannel('com.secure.apple_finance_tracker/sms');
+            List<Map<String, dynamic>> _transactions = [];
+            Map<String, double> _categoryTotals = {};
+            double _totalSpent = 0.0;
+            bool _isLoading = true;
+
+            static const List<Map<String, dynamic>> _categories = [
+              {'name': 'Food & Dining', 'icon': CupertinoIcons.cart_fill, 'color': Color(0xFFFF9500)},
+              {'name': 'Shopping', 'icon': CupertinoIcons.bag_fill, 'color': Color(0xFFAF52DE)},
+              {'name': 'Travel & Fuel', 'icon': CupertinoIcons.car_detailed, 'color': Color(0xFF007AFF)},
+              {'name': 'Bills & Utilities', 'icon': CupertinoIcons.bolt_fill, 'color': Color(0xFFFF3B30)},
+              {'name': 'Groceries', 'icon': CupertinoIcons.basket_fill, 'color': Color(0xFF34C759)},
+              {'name': 'Other', 'icon': CupertinoIcons.square_grid_2x2_fill, 'color': Color(0xFF8E8E93)},
+            ];
+
+            @override
+            void initState() {
+              super.initState();
+              _refreshTransactions();
+              _scanInboxSms();
+            }
+
+            Future<void> _scanInboxSms() async {
+              try {
+                final List<dynamic> messages = await platform.invokeMethod('getInboxSms');
+                for (var msg in messages) {
+                  if (msg is String) {
+                    await _handleIncomingSms(msg);
+                  }
+                }
+              } catch (_) {}
+            }
+
+            Map<String, dynamic>? _parseBankSms(String body) {
+              final debitRegex = RegExp(r'(debited|spent|paid|sent|withdrawn|purchase)', caseSensitive: false);
+              if (!debitRegex.hasMatch(body)) return null;
+
+              final amountRegex = RegExp(r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)', caseSensitive: false);
+              final amountMatch = amountRegex.firstMatch(body);
+              if (amountMatch == null) return null;
+
+              final amountStr = amountMatch.group(1)!.replaceAll(',', '');
+              final amount = double.tryParse(amountStr);
+              if (amount == null || amount <= 0) return null;
+
+              final merchantRegex = RegExp(r'(?:to|at|vpa|info:?)\s+([A-Za-z0-9@._\-\s]{2,22}?)(?:\s+on|\s+ref|\.|,|\s+UPI|$)', caseSensitive: false);
+              final merchantMatch = merchantRegex.firstMatch(body);
+              String merchant = merchantMatch?.group(1)?.trim().toUpperCase() ?? 'UNKNOWN MERCHANT';
+
+              return {'amount': amount, 'merchant': merchant};
+            }
+
+            Future<void> _handleIncomingSms(String smsBody) async {
+              final parsed = _parseBankSms(smsBody);
+              if (parsed == null) return;
+
+              final double amount = parsed['amount'];
+              final String merchant = parsed['merchant'];
+
+              final db = await EncryptedDbHelper.database;
+              final existingRule = await db.query('merchant_rules', where: 'merchant = ?', whereArgs: [merchant]);
+
+              if (existingRule.isNotEmpty) {
+                final category = existingRule.first['category'] as String;
+                await _saveTransaction(amount, merchant, category, smsBody);
+              } else {
+                String? guessedCategory = _guessCategoryFromKeywords(merchant);
+                if (guessedCategory != null) {
+                  await _saveTransaction(amount, merchant, guessedCategory, smsBody);
+                } else {
+                  if (mounted) {
+                    _showUnknownCategoryPopup(amount, merchant, smsBody);
+                  }
+                }
+              }
+            }
+
+            String? _guessCategoryFromKeywords(String merchant) {
+              if (RegExp(r'SWIGGY|ZOMATO|DOMINOS|CAFE|RESTAURANT|STARBUCKS').hasMatch(merchant)) return 'Food & Dining';
+              if (RegExp(r'AMAZON|FLIPKART|MYNTRA|AJIO|ZUDIO').hasMatch(merchant)) return 'Shopping';
+              if (RegExp(r'UBER|OLA|RAPIDO|IRCTC|PETROL|SHELL|HPCL|BPCL').hasMatch(merchant)) return 'Travel & Fuel';
+              if (RegExp(r'JIO|AIRTEL|BESCOM|TORRENT|ELECTRIC|RECHARGE').hasMatch(merchant)) return 'Bills & Utilities';
+              if (RegExp(r'BLINKIT|ZEPTO|INSTAMART|DMART|BIGBASKET').hasMatch(merchant)) return 'Groceries';
+              return null;
+            }
+
+            Future<void> _saveTransaction(double amount, String merchant, String category, String rawSms) async {
+              final db = await EncryptedDbHelper.database;
+              await db.insert('transactions', {
+                'amount': amount,
+                'merchant': merchant,
+                'category': category,
+                'rawSms': rawSms,
+                'timestamp': DateTime.now().millisecondsSinceEpoch,
+              }, conflictAlgorithm: ConflictAlgorithm.ignore);
+              await db.insert('merchant_rules', {'merchant': merchant, 'category': category}, conflictAlgorithm: ConflictAlgorithm.replace);
+              await _refreshTransactions();
+            }
+
+            Future<void> _refreshTransactions() async {
+              final db = await EncryptedDbHelper.database;
+              final rows = await db.query('transactions', orderBy: 'timestamp DESC');
+
+              double total = 0;
+              Map<String, double> catMap = {};
+              for (var row in rows) {
+                final amt = (row['amount'] as num).toDouble();
+                final cat = row['category'] as String;
+                total += amt;
+                catMap[cat] = (catMap[cat] ?? 0) + amt;
+              }
+
+              if (mounted) {
+                setState(() {
+                  _transactions = rows;
+                  _totalSpent = total;
+                  _categoryTotals = catMap;
+                  _isLoading = false;
+                });
+              }
+            }
+
+            void _showUnknownCategoryPopup(double amount, String merchant, String rawSms) {
+              showCupertinoModalPopup(
+                context: context,
+                barrierDismissible: false,
+                builder: (ctx) => CupertinoActionSheet(
+                  title: const Text('New Uncategorized Expense', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: CupertinoColors.black)),
+                  message: Text('₹${amount.toStringAsFixed(2)} paid to "$merchant".\nWhich category does this belong to?\n(We will remember this for next time)', style: const TextStyle(fontSize: 14)),
+                  actions: _categories.map((cat) {
+                    return CupertinoActionSheetAction(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        _saveTransaction(amount, merchant, cat['name'], rawSms);
+                      },
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(cat['icon'], color: cat['color'], size: 20),
+                          const SizedBox(width: 10),
+                          Text(cat['name'], style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w500, color: Color(0xFF007AFF))),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                  cancelButton: CupertinoActionSheetAction(
+                    isDestructiveAction: true,
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text('Ignore Message'),
+                  ),
+                ),
+              );
+            }
+
+            void _showTestSmsSimulator() {
+              final controller = TextEditingController(text: 'Rs. 640.00 debited from A/c XX4821 to VPA sharmabakery@okaxis on 20-10-26.');
+              showCupertinoDialog(
+                context: context,
+                builder: (ctx) => CupertinoAlertDialog(
+                  title: const Text('Simulate Incoming Bank SMS'),
+                  content: Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: CupertinoTextField(controller: controller, maxLines: 3, placeholder: 'Paste or type bank SMS...'),
+                  ),
+                  actions: [
+                    CupertinoDialogAction(child: const Text('Cancel'), onPressed: () => Navigator.pop(ctx)),
+                    CupertinoDialogAction(isDefaultAction: true, child: const Text('Process SMS'), onPressed: () { Navigator.pop(ctx); _handleIncomingSms(controller.text); }),
+                  ],
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final currencyFormat = NumberFormat.currency(locale: 'en_IN', symbol: '₹', decimalDigits: 0);
+
+              return CupertinoPageScaffold(
+                child: CustomScrollView(
+                  physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                  slivers: [
+                    CupertinoSliverNavigationBar(
+                      largeTitle: const Text('Summary'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CupertinoButton(padding: EdgeInsets.zero, onPressed: _showTestSmsSimulator, child: const Icon(CupertinoIcons.chat_bubble_text_fill, size: 22)),
+                          const SizedBox(width: 12),
+                          CupertinoButton(padding: EdgeInsets.zero, onPressed: _scanInboxSms, child: const Icon(CupertinoIcons.arrow_clockwise_circle_fill, size: 24)),
+                        ],
+                      ),
+                    ),
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(24),
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(colors: [Color(0xFF1C1C1E), Color(0xFF2C2C2E)], begin: Alignment.topLeft, end: Alignment.bottomRight),
+                                borderRadius: BorderRadius.circular(22),
+                                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.14), blurRadius: 24, offset: const Offset(0, 10))],
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      const Text('TOTAL SPENT', style: TextStyle(color: Color(0xFF8E8E93), fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 1.1)),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                        decoration: BoxDecoration(color: const Color(0xFF34C759).withOpacity(0.2), borderRadius: BorderRadius.circular(8)),
+                                        child: const Row(
+                                          children: [
+                                            Icon(CupertinoIcons.lock_fill, color: Color(0xFF34C759), size: 12),
+                                            SizedBox(width: 4),
+                                            Text('AES-256 Local', style: TextStyle(color: Color(0xFF34C759), fontSize: 11, fontWeight: FontWeight.w600)),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Text(currencyFormat.format(_totalSpent), style: const TextStyle(color: CupertinoColors.white, fontSize: 38, fontWeight: FontWeight.w800, letterSpacing: -1)),
+                                  const SizedBox(height: 6),
+                                  Text('${_transactions.length} tracked SMS transactions', style: const TextStyle(color: Color(0xFFAEAEB2), fontSize: 13)),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 28),
+                            const Text('CATEGORIES', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF8E8E93), letterSpacing: 0.5)),
+                            const SizedBox(height: 10),
+                            GridView.builder(
+                              shrinkWrap: true,
+                              padding: EdgeInsets.zero,
+                              physics: const NeverScrollableScrollPhysics(),
+                              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 12, childAspectRatio: 1.65),
+                              itemCount: _categories.length,
+                              itemBuilder: (ctx, i) {
+                                final cat = _categories[i];
+                                final amount = _categoryTotals[cat['name']] ?? 0.0;
+                                return Container(
+                                  padding: const EdgeInsets.all(14),
+                                  decoration: BoxDecoration(color: CupertinoColors.white, borderRadius: BorderRadius.circular(18), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 4))]),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Container(
+                                            padding: const EdgeInsets.all(7),
+                                            decoration: BoxDecoration(color: (cat['color'] as Color).withOpacity(0.15), borderRadius: BorderRadius.circular(10)),
+                                            child: Icon(cat['icon'], color: cat['color'], size: 18),
+                                          ),
+                                          Text(currencyFormat.format(amount), style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+                                        ],
+                                      ),
+                                      Text(cat['name'], maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFF3A3A3C))),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                            const SizedBox(height: 28),
+                            const Text('RECENT TRANSACTIONS', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF8E8E93), letterSpacing: 0.5)),
+                            const SizedBox(height: 10),
+                            Container(
+                              decoration: BoxDecoration(color: CupertinoColors.white, borderRadius: BorderRadius.circular(18)),
+                              child: _isLoading
+                                  ? const Padding(padding: EdgeInsets.all(32), child: Center(child: CupertinoActivityIndicator()))
+                                  : _transactions.isEmpty
+                                      ? Padding(
+                                          padding: const EdgeInsets.all(32),
+                                          child: Center(
+                                            child: Column(
+                                              children: [
+                                                const Icon(CupertinoIcons.tray, size: 36, color: CupertinoColors.systemGrey3),
+                                                const SizedBox(height: 8),
+                                                const Text('No expenses logged yet.', style: TextStyle(color: CupertinoColors.systemGrey, fontSize: 15)),
+                                                const SizedBox(height: 12),
+                                                CupertinoButton(padding: EdgeInsets.zero, onPressed: _showTestSmsSimulator, child: const Text('Tap to test unknown SMS popup')),
+                                              ],
+                                            ),
+                                          ),
+                                        )
+                                      : ListView.separated(
+                                          shrinkWrap: true,
+                                          padding: EdgeInsets.zero,
+                                          physics: const NeverScrollableScrollPhysics(),
+                                          itemCount: _transactions.length,
+                                          separatorBuilder: (_, __) => const Divider(height: 1, indent: 60, color: Color(0xFFE5E5EA)),
+                                          itemBuilder: (ctx, i) {
+                                            final tx = _transactions[i];
+                                            final catMeta = _categories.firstWhere((c) => c['name'] == tx['category'], orElse: () => _categories.last);
+                                            final date = DateTime.fromMillisecondsSinceEpoch(tx['timestamp'] as int);
+                                            return Padding(
+                                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+                                              child: Row(
+                                                children: [
+                                                  Container(
+                                                    padding: const EdgeInsets.all(10),
+                                                    decoration: BoxDecoration(color: (catMeta['color'] as Color).withOpacity(0.14), borderRadius: BorderRadius.circular(12)),
+                                                    child: Icon(catMeta['icon'], color: catMeta['color'], size: 20),
+                                                  ),
+                                                  const SizedBox(width: 14),
+                                                  Expanded(
+                                                    child: Column(
+                                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                                      children: [
+                                                        Text(tx['merchant'], style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+                                                        const SizedBox(height: 2),
+                                                        Text('${tx['category']} • ${DateFormat('dd MMM, hh:mm a').format(date)}', style: const TextStyle(color: Color(0xFF8E8E93), fontSize: 13)),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                  Text('-₹${(tx['amount'] as num).toStringAsFixed(0)}', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: Color(0xFF1C1C1E))),
+                                                ],
+                                              ),
+                                            );
+                                          },
+                                        ),
+                            ),
+                            const SizedBox(height: 40),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: 5. Configure Android Manifest, Security Flags & Native SMS Reader
         run: |
           cat << 'EOF' > android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -66,13 +551,6 @@ jobs:
                       </intent-filter>
                   </activity>
 
-                  <receiver android:name="com.shounakmulay.telephony.sms.IncomingSmsReceiver"
-                      android:permission="android.permission.BROADCAST_SMS" android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.provider.Telephony.SMS_RECEIVED"/>
-                      </intent-filter>
-                  </receiver>
-
                   <meta-data
                       android:name="flutterEmbedding"
                       android:value="2" />
@@ -84,11 +562,21 @@ jobs:
           cat << 'EOF' > "$MAIN_ACT"
           package com.secure.apple_finance_tracker
 
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.database.Cursor
+          import android.net.Uri
           import android.os.Bundle
           import android.view.WindowManager
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
           import io.flutter.embedding.android.FlutterFragmentActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
 
           class MainActivity: FlutterFragmentActivity() {
+              private val CHANNEL = "com.secure.apple_finance_tracker/sms"
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   window.setFlags(
@@ -96,19 +584,36 @@ jobs:
                       WindowManager.LayoutParams.FLAG_SECURE
                   )
               }
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+                      if (call.method == "getInboxSms") {
+                          if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+                              ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS), 123)
+                          }
+                          val smsList = mutableListOf<String>()
+                          val uri: Uri = Uri.parse("content://sms/inbox")
+                          val cursor: Cursor? = contentResolver.query(uri, arrayOf("body"), null, null, "date DESC LIMIT 20")
+                          cursor?.use {
+                              val bodyIndex = it.getColumnIndex("body")
+                              while (it.moveToNext()) {
+                                  if (bodyIndex >= 0) {
+                                      smsList.add(it.getString(bodyIndex))
+                                  }
+                              }
+                          }
+                          result.success(smsList)
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+              }
           }
           EOF
 
-      - name: 6. Fix Telephony Plugin Namespace & Set Min SDK
+      - name: 6. Set Minimum Android SDK to 23
         run: |
-          # Inject namespace into another_telephony plugin build.gradle
-          PLUGIN_GRADLE=$(find ~/.pub-cache -name "build.gradle" | grep "another_telephony" || true)
-          if [ -n "$PLUGIN_GRADLE" ]; then
-            echo "Fixing namespace in $PLUGIN_GRADLE"
-            sed -i 's/android {/android {\n    namespace "com.shounakmulay.telephony"/g' "$PLUGIN_GRADLE"
-          fi
-
-          # Set minimum SDK to 23
           if [ -f "android/app/build.gradle" ]; then
             sed -i 's/minSdkVersion .*/minSdkVersion 23/g' android/app/build.gradle
             sed -i 's/minSdk = .*/minSdk = 23/g' android/app/build.gradle
