@@ -33,9 +33,6 @@ class AppleFinanceApp extends StatelessWidget {
   }
 }
 
-// ==========================================
-// 1. BIOMETRIC / PASSWORD LOCK SCREEN
-// ==========================================
 class AuthGateScreen extends StatefulWidget {
   const AuthGateScreen({super.key});
 
@@ -124,9 +121,6 @@ class _AuthGateScreenState extends State<AuthGateScreen> {
   }
 }
 
-// ==========================================
-// 2. AES-256 ENCRYPTED DATABASE HELPER
-// ==========================================
 class EncryptedDbHelper {
   static Database? _db;
   static const _secureStorage = FlutterSecureStorage();
@@ -175,9 +169,6 @@ class EncryptedDbHelper {
   }
 }
 
-// ==========================================
-// 3. MAIN APPLE-STYLE DASHBOARD & SMS ENGINE
-// ==========================================
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
 
