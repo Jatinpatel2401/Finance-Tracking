@@ -99,8 +99,16 @@ jobs:
           }
           EOF
 
-      - name: 6. Set Minimum Android SDK to 23
+      - name: 6. Fix Telephony Plugin Namespace & Set Min SDK
         run: |
+          # Inject namespace into another_telephony plugin build.gradle
+          PLUGIN_GRADLE=$(find ~/.pub-cache -name "build.gradle" | grep "another_telephony" || true)
+          if [ -n "$PLUGIN_GRADLE" ]; then
+            echo "Fixing namespace in $PLUGIN_GRADLE"
+            sed -i 's/android {/android {\n    namespace "com.shounakmulay.telephony"/g' "$PLUGIN_GRADLE"
+          fi
+
+          # Set minimum SDK to 23
           if [ -f "android/app/build.gradle" ]; then
             sed -i 's/minSdkVersion .*/minSdkVersion 23/g' android/app/build.gradle
             sed -i 's/minSdk = .*/minSdk = 23/g' android/app/build.gradle
@@ -119,3 +127,4 @@ jobs:
         with:
           name: Wallet-Tracker-APK-Bundle
           path: build/app/outputs/flutter-apk/app-release.apk
+
