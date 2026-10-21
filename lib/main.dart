@@ -2,10 +2,10 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:sqflite_sqlcipher/sqflite.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:another_telephony/telephony.dart';
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 
@@ -64,7 +64,7 @@ class _AuthGateScreenState extends State<AuthGateScreen> {
       bool didAuth = await _auth.authenticate(
         localizedReason: 'Unlock your encrypted Finance Tracker',
         options: const AuthenticationOptions(
-          biometricOnly: false, // Allows Fingerprint, Face, or Device PIN
+          biometricOnly: false,
           stickyAuth: true,
         ),
       );
@@ -138,7 +138,6 @@ class EncryptedDbHelper {
   }
 
   static Future<Database> _initEncryptedDb() async {
-    // Generate or read a 256-bit hardware-backed key stored in Android Keystore
     String? encryptionKey = await _secureStorage.read(key: 'db_aes_key');
     if (encryptionKey == null) {
       final random = Random.secure();
@@ -187,7 +186,7 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  final Telephony _telephony = Telephony.instance;
+  static const platform = MethodChannel('com.secure.apple_finance_tracker/sms');
   List<Map<String, dynamic>> _transactions = [];
   Map<String, double> _categoryTotals = {};
   double _totalSpent = 0.0;
@@ -205,29 +204,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
-    _initializeDataAndSms();
+    _refreshTransactions();
+    _scanInboxSms();
   }
 
-  Future<void> _initializeDataAndSms() async {
-    await _refreshTransactions();
-    await _setupSmsListener();
+  Future<void> _scanInboxSms() async {
+    try {
+      final List<dynamic> messages = await platform.invokeMethod('getInboxSms');
+      for (var msg in messages) {
+        if (msg is String) {
+          await _handleIncomingSms(msg);
+        }
+      }
+    } catch (_) {}
   }
 
-  Future<void> _setupSmsListener() async {
-    bool? granted = await _telephony.requestPhoneAndSmsPermissions;
-    if (granted == true) {
-      _telephony.listenIncomingSms(
-        onNewMessage: (SmsMessage message) {
-          if (message.body != null) {
-            _handleIncomingSms(message.body!);
-          }
-        },
-        listenInBackground: false,
-      );
-    }
-  }
-
-  // Regex parser for Bank & UPI debit messages
   Map<String, dynamic>? _parseBankSms(String body) {
     final debitRegex = RegExp(r'(debited|spent|paid|sent|withdrawn|purchase)', caseSensitive: false);
     if (!debitRegex.hasMatch(body)) return null;
@@ -262,16 +253,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
 
     if (existingRule.isNotEmpty) {
-      // Known merchant: auto-categorize silently
       final category = existingRule.first['category'] as String;
       await _saveTransaction(amount, merchant, category, smsBody);
     } else {
-      // Unknown merchant: check built-in smart keywords first
       String? guessedCategory = _guessCategoryFromKeywords(merchant);
       if (guessedCategory != null) {
         await _saveTransaction(amount, merchant, guessedCategory, smsBody);
       } else {
-        // Completely unknown entry -> Trigger Apple-style Category Popup!
         if (mounted) {
           _showUnknownCategoryPopup(amount, merchant, smsBody);
         }
@@ -296,7 +284,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       'category': category,
       'rawSms': rawSms,
       'timestamp': DateTime.now().millisecondsSinceEpoch,
-    });
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
     await db.insert(
       'merchant_rules',
       {'merchant': merchant, 'category': category},
@@ -328,24 +316,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  // Scan recent inbox SMS messages on demand
-  Future<void> _scanRecentInboxSms() async {
-    bool? granted = await _telephony.requestPhoneAndSmsPermissions;
-    if (granted != true) return;
-
-    final messages = await _telephony.getInboxSms(
-      columns: [SmsColumn.ADDRESS, SmsColumn.BODY, SmsColumn.DATE],
-    );
-
-    // Check the latest 15 SMS messages
-    for (var msg in messages.take(15)) {
-      if (msg.body != null) {
-        await _handleIncomingSms(msg.body!);
-      }
-    }
-  }
-
-  // Apple-style Bottom Sheet Popup when a merchant isn't recognized
   void _showUnknownCategoryPopup(double amount, String merchant, String rawSms) {
     showCupertinoModalPopup(
       context: context,
@@ -387,7 +357,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  // Test simulator dialog so you can immediately test the popup
   void _showTestSmsSimulator() {
     final controller = TextEditingController(
       text: 'Rs. 640.00 debited from A/c XX4821 to VPA sharmabakery@okaxis on 20-10-26.',
@@ -443,7 +412,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 const SizedBox(width: 12),
                 CupertinoButton(
                   padding: EdgeInsets.zero,
-                  onPressed: _scanRecentInboxSms,
+                  onPressed: _scanInboxSms,
                   child: const Icon(CupertinoIcons.arrow_clockwise_circle_fill, size: 24),
                 ),
               ],
@@ -455,7 +424,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // APPLE WALLET HERO CARD
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(24),
@@ -526,7 +494,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ],
                     ),
                   ),
-
                   const SizedBox(height: 28),
                   const Text(
                     'CATEGORIES',
@@ -538,8 +505,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
-
-                  // CATEGORY BREAKDOWN CARDS
                   GridView.builder(
                     shrinkWrap: true,
                     padding: EdgeInsets.zero,
@@ -603,7 +568,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       );
                     },
                   ),
-
                   const SizedBox(height: 28),
                   const Text(
                     'RECENT TRANSACTIONS',
@@ -615,8 +579,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
-
-                  // APPLE CUPERTINO GROUPED TRANSACTION LIST
                   Container(
                     decoration: BoxDecoration(
                       color: CupertinoColors.white,
@@ -715,3 +677,4 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 }
+
